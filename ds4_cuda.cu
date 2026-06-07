@@ -4669,6 +4669,147 @@ __global__ static void indexer_scores_wmma_kernel(
 #endif
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+/* gfx1151 (RDNA3.5, wave32) native WMMA indexer-scores kernel.
+ *
+ * The CUDA indexer_scores_wmma_kernel above relies on nvcuda::wmma, which is
+ * unavailable on ROCm, and the Windows HIP SDK ships only the rocWMMA *version*
+ * header (no fragment templates). So we drive the matrix core directly with the
+ * clang HIP intrinsic __builtin_amdgcn_wmma_f32_16x16x16_f16_w32, available in
+ * ROCm 7.1 clang for gfx11/gfx115x.
+ *
+ * Wave32 fragment layout (RDNA3 / gfx11 family — see GPUOpen "WMMA on RDNA3"):
+ *   - A_frag / B_frag: each lane supplies a half16 (16 packed f16). For the
+ *     16x16x16 f16 op, lane L holds the full K=16 vector for one row of the
+ *     16x16 input tile: a_frag[k] = A[L][k], b_frag[k] = B[L][k]. The op forms
+ *     D[i][j] = sum_k A_frag(row i)·B_frag(row j) = (A · B^T)[i][j]. Contents
+ *     are replicated across lanes 0-15 and 16-31.
+ *   - C/D accumulator (f32): each lane holds 8 f32 (float8). RDNA3 maps them
+ *     interleaved: D[2*ele + (lane/16)][lane%16] = c_frag[ele], ele in 0..7.
+ *
+ * We compute, per head h, dot[t][c] = sum_d q[t,h,d]*index_comp[c,d] as
+ * A(token x d) WMMA B(comp x d) -> D(token x comp), then apply exactly the
+ * scalar kernel's post-processing: total += ReLU(dot) * weights[t,h] over all
+ * heads, scores[t][c] = total*scale, with the same causal -INF masking. One
+ * 32-lane block per 16x16 (token x comp) output tile. */
+typedef _Float16 ds4_half16 __attribute__((ext_vector_type(16)));
+typedef float    ds4_float8  __attribute__((ext_vector_type(8)));
+
+__global__ static void indexer_scores_wmma_hip_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+    const uint32_t tile_t = blockIdx.y * 16u;   // first token of this tile
+    const uint32_t tile_c = blockIdx.x * 16u;   // first comp of this tile
+    const uint32_t lane   = threadIdx.x & 31u;
+    if (threadIdx.x >= 32u || head_dim != 128u) return;
+
+    // Fast causal rejection: if no (token,comp) in this tile can be visible,
+    // fill the whole tile with -INF (matches scalar kernel for c>=n_visible).
+    if (causal) {
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t max_visible = last_token > tile_t
+            ? min((pos0 + last_token) / ratio, n_comp)   // largest n_visible in tile
+            : 0u;
+        if (tile_c >= max_visible) {
+            for (uint32_t i = lane; i < 16u * 16u; i += 32u) {
+                const uint32_t token = tile_t + (i >> 4u);
+                const uint32_t comp  = tile_c + (i & 15u);
+                if (token < n_tokens && comp < n_comp)
+                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+            }
+            return;
+        }
+    }
+
+    // Shared f16 staging of the two 16x128 input tiles, plus f32 accumulator.
+    __shared__ _Float16 a_sh[16 * 128];   // q tile:   [token][d]
+    __shared__ _Float16 b_sh[16 * 128];   // comp tile:[comp][d]
+    __shared__ float    acc_sh[16 * 16];  // running total over heads
+
+    for (uint32_t i = lane; i < 16u * 16u; i += 32u) acc_sh[i] = 0.0f;
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        // Stage q[token,h,:] into a_sh (zero-padded rows beyond n_tokens).
+        for (uint32_t i = lane; i < 16u * 128u; i += 32u) {
+            const uint32_t r = i >> 7u;        // token within tile
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            float v = 0.0f;
+            if (token < n_tokens)
+                v = q[((uint64_t)token * n_head + h) * head_dim + d];
+            a_sh[i] = (_Float16)v;
+        }
+        // Stage index_comp[comp,:] into b_sh (zero-padded rows beyond n_comp).
+        for (uint32_t i = lane; i < 16u * 128u; i += 32u) {
+            const uint32_t r = i >> 7u;        // comp within tile
+            const uint32_t d = i & 127u;
+            const uint32_t comp = tile_c + r;
+            float v = 0.0f;
+            if (comp < n_comp)
+                v = index_comp[(uint64_t)comp * head_dim + d];
+            b_sh[i] = (_Float16)v;
+        }
+        __syncthreads();
+
+        // D(token x comp) = sum over 8 K-tiles of A(token x k) * B(comp x k)^T.
+        ds4_float8 c_frag = {0,0,0,0,0,0,0,0};
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            ds4_half16 a_frag;
+            ds4_half16 b_frag;
+            const uint32_t row = lane & 15u;   // lanes 0-15 == lanes 16-31 (replicated)
+            #pragma unroll
+            for (uint32_t e = 0; e < 16u; e++) {
+                a_frag[e] = a_sh[row * 128u + k0 + e];  // A[token=row][k0+e]
+                b_frag[e] = b_sh[row * 128u + k0 + e];  // B[comp=row][k0+e]
+            }
+            c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
+        }
+
+        // Scatter c_frag to acc_sh using the RDNA3 f32 accumulator layout, then
+        // apply ReLU and the per-(token,head) weight, exactly as the scalar
+        // kernel: total += fmaxf(dot, 0) * weights[token,h].
+        #pragma unroll
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t r = 2u * e + (lane >> 4u);   // token within tile
+            const uint32_t col = lane & 15u;            // comp within tile
+            const uint32_t token = tile_t + r;
+            if (token < n_tokens) {
+                const float w = weights[(uint64_t)token * n_head + h];
+                acc_sh[r * 16u + col] += fmaxf(c_frag[e], 0.0f) * w;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Final scale + causal mask + store (matches scalar scores[t,c]=total*scale,
+    // and the per-element n_visible test for partially-visible tiles).
+    for (uint32_t i = lane; i < 16u * 16u; i += 32u) {
+        const uint32_t r = i >> 4u;
+        const uint32_t col = i & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp  = tile_c + col;
+        if (token < n_tokens && comp < n_comp) {
+            float out = acc_sh[i] * scale;
+            if (causal) {
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                if (comp >= visible) out = -INFINITY;
+            }
+            scores[(uint64_t)token * n_comp + comp] = out;
+        }
+    }
+}
+#endif // __HIP_PLATFORM_AMD__
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -5096,6 +5237,23 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
     }
 #endif // !__HIP_PLATFORM_AMD__
+#ifdef __HIP_PLATFORM_AMD__
+    // gfx1151 native wave32 WMMA path. Default OFF (env opt-in) so the proven
+    // scalar indexer_scores_kernel below stays the default until the orchestrator
+    // validates correctness on-GPU (preserves the issue #348 fix). Shapes are the
+    // hot indexer case: head_dim==128, n_head==64, non-quality.
+    if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
+        getenv("DS4_ROCM_WMMA") != NULL) {
+        dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
+        indexer_scores_wmma_hip_kernel<<<grid, 32>>>((float *)scores->ptr,
+                                                     (const float *)q->ptr,
+                                                     (const float *)weights->ptr,
+                                                     (const float *)index_comp->ptr,
+                                                     n_comp, n_tokens, pos0, n_head,
+                                                     head_dim, ratio, scale, causal ? 1 : 0);
+        return cuda_ok(cudaGetLastError(), "indexer scores wmma hip launch");
+    }
+#endif // __HIP_PLATFORM_AMD__
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
                                          (const float *)q->ptr,
