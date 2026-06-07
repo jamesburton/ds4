@@ -345,6 +345,13 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
+    /* Optional, default-off: when DS4_BENCH_DUMP_GEN is set, decode the greedy
+     * generated tokens at each frontier and print them to stderr.  This lets a
+     * long-context capability demo verify that output is COHERENT (not just that
+     * the KV cache allocated and prefilled).  No effect on CSV or timing. */
+    const bool dump_gen = getenv("DS4_BENCH_DUMP_GEN") != NULL &&
+                          getenv("DS4_BENCH_DUMP_GEN")[0] != '\0' &&
+                          getenv("DS4_BENCH_DUMP_GEN")[0] != '0';
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -373,6 +380,7 @@ int main(int argc, char **argv) {
             break;
         }
 
+        if (dump_gen) fprintf(stderr, "ds4-bench: gen@%d: ", frontier);
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -386,6 +394,14 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (dump_gen) {
+                size_t tlen = 0;
+                char *piece = ds4_token_text(engine, token, &tlen);
+                if (piece) {
+                    fwrite(piece, 1, tlen, stderr);
+                    free(piece);
+                }
+            }
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -393,6 +409,7 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        if (dump_gen) { fputc('\n', stderr); fflush(stderr); }
         if (rc != 0) break;
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {

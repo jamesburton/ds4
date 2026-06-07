@@ -15,5 +15,6 @@
 # HIP SDK's libhipblas.dll by win/build-rocm.sh).
 /win/third_party/hipblas.lib
 /misc/
+/demo-out/
 .*.swp
 .DS_Store
