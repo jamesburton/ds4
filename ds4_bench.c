@@ -32,6 +32,8 @@ typedef struct {
     const char *chat_prompt_path;
     const char *system;
     const char *csv_path;
+    const char *save_session_path;
+    const char *load_session_path;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -85,7 +87,19 @@ static void usage(FILE *fp) {
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
-        "  -h, --help             Show this help.\n");
+        "  -h, --help             Show this help.\n"
+        "\n"
+        "Prefix-cache demo (default off; both run a single frontier = --ctx-start):\n"
+        "  --save-session FILE\n"
+        "      Cold-prefill the prefix, then write the serialized session payload\n"
+        "      (ds4_session_save_payload) to FILE. Reports cold prefill time and\n"
+        "      payload bytes. Use this to populate a prefix-cache entry.\n"
+        "  --load-session FILE\n"
+        "      Restore the session payload from FILE (ds4_session_load_payload)\n"
+        "      instead of cold-prefilling. Reports restore (warm) time and the\n"
+        "      prefill time it skipped. The restored prefix must match the prompt\n"
+        "      sliced at --ctx-start. Combine with DS4_BENCH_DUMP_GEN=1 to verify\n"
+        "      the continued greedy generation matches a cold run.\n");
 }
 
 static int parse_int(const char *s, const char *opt) {
@@ -213,6 +227,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.gen_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--save-session")) {
+            c.save_session_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--load-session")) {
+            c.load_session_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -236,6 +254,10 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.save_session_path && c.load_session_path) {
+        fprintf(stderr, "ds4-bench: use only one of --save-session / --load-session per run\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -289,6 +311,143 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+/* Greedy, EOS-skipping decode of cfg.gen_tokens tokens from the current session
+ * frontier.  Used by both the sweep and the prefix-cache demo so the warm and
+ * cold paths produce byte-identical generation when their prefixes match.  When
+ * dump_gen is set, the decoded text is written to stderr for correctness checks. */
+static int bench_decode_gen(ds4_engine *engine, ds4_session *session,
+                            const bench_config *cfg, int eos, bool dump_gen,
+                            double *out_sec) {
+    char err[256];
+    const double t0 = bench_now_sec();
+    for (int i = 0; i < cfg->gen_tokens; i++) {
+        if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+            fprintf(stderr, "ds4-bench: generation would exceed allocated context\n");
+            return 1;
+        }
+        const int token = ds4_session_argmax_excluding(session, eos);
+        if (token < 0) {
+            fprintf(stderr, "ds4-bench: failed to choose non-EOS token\n");
+            return 1;
+        }
+        if (dump_gen) {
+            size_t tlen = 0;
+            char *piece = ds4_token_text(engine, token, &tlen);
+            if (piece) { fwrite(piece, 1, tlen, stderr); free(piece); }
+        }
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: decode failed: %s\n", err);
+            return 1;
+        }
+    }
+    if (out_sec) *out_sec = bench_now_sec() - t0;
+    return 0;
+}
+
+/* Prefix-cache demonstration mode (default off).  Exercises the exact disk
+ * payload API the server's KV disk cache uses (ds4_session_save_payload /
+ * ds4_session_load_payload) so the orchestrator can measure cold prefill versus
+ * a warm restore that eliminates it.  Runs a single frontier = cfg.ctx_start. */
+static int run_session_file_mode(ds4_engine *engine, ds4_session *session,
+                                 const ds4_tokens *prompt, const bench_config *cfg,
+                                 int eos, bool dump_gen) {
+    char err[256];
+    const int frontier = cfg->ctx_start;
+    ds4_tokens prefix = { .v = prompt->v, .len = frontier, .cap = frontier };
+
+    if (cfg->load_session_path) {
+        FILE *fp = fopen(cfg->load_session_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                    cfg->load_session_path, strerror(errno));
+            return 1;
+        }
+        if (fseek(fp, 0, SEEK_END) != 0) { fprintf(stderr, "ds4-bench: seek failed\n"); fclose(fp); return 1; }
+        long fsz = ftell(fp);
+        if (fsz < 0 || fseek(fp, 0, SEEK_SET) != 0) { fprintf(stderr, "ds4-bench: tell/rewind failed\n"); fclose(fp); return 1; }
+
+        const double t0 = bench_now_sec();
+        const int rc = ds4_session_load_payload(session, fp, (uint64_t)fsz, err, sizeof(err));
+        fclose(fp);
+        const double restore_sec = bench_now_sec() - t0;
+        if (rc != 0) {
+            fprintf(stderr, "ds4-bench: load-session failed: %s\n", err);
+            return 1;
+        }
+        /* The restored checkpoint must equal the prompt sliced at the frontier,
+         * otherwise the continued generation would diverge from a cold run. */
+        const ds4_tokens *live = ds4_session_tokens(session);
+        if (live->len != frontier) {
+            fprintf(stderr, "ds4-bench: restored prefix is %d tokens, expected frontier %d\n",
+                    live->len, frontier);
+            return 1;
+        }
+        for (int i = 0; i < frontier; i++) {
+            if (live->v[i] != prompt->v[i]) {
+                fprintf(stderr, "ds4-bench: restored prefix diverges from prompt at token %d\n", i);
+                return 1;
+            }
+        }
+        fprintf(stderr,
+                "ds4-bench: WARM restore of %d-token prefix from %s in %.3f s "
+                "(%.1f MiB, %.0f MiB/s) -- cold prefill SKIPPED\n",
+                frontier, cfg->load_session_path, restore_sec,
+                (double)fsz / (1024.0 * 1024.0),
+                restore_sec > 0.0 ? ((double)fsz / (1024.0 * 1024.0)) / restore_sec : 0.0);
+
+        if (dump_gen) fprintf(stderr, "ds4-bench: gen@%d(warm): ", frontier);
+        double gen_sec = 0.0;
+        if (bench_decode_gen(engine, session, cfg, eos, dump_gen, &gen_sec) != 0) return 1;
+        if (dump_gen) { fputc('\n', stderr); fflush(stderr); }
+        printf("mode,frontier,restore_sec,payload_bytes,gen_tokens,gen_tps\n");
+        printf("warm,%d,%.4f,%lld,%d,%.2f\n", frontier, restore_sec,
+               (long long)fsz, cfg->gen_tokens,
+               gen_sec > 0.0 ? (double)cfg->gen_tokens / gen_sec : 0.0);
+        return 0;
+    }
+
+    /* --save-session: cold prefill, save payload, then generate (so the saver's
+     * own continued output can be compared against a later warm run). */
+    const double prefill_t0 = bench_now_sec();
+    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: cold prefill to %d failed: %s\n", frontier, err);
+        return 1;
+    }
+    const double prefill_sec = bench_now_sec() - prefill_t0;
+
+    FILE *fp = fopen(cfg->save_session_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                cfg->save_session_path, strerror(errno));
+        return 1;
+    }
+    const uint64_t payload_bytes = ds4_session_payload_bytes(session);
+    const double save_t0 = bench_now_sec();
+    const int rc = ds4_session_save_payload(session, fp, err, sizeof(err));
+    const int closerc = fclose(fp);
+    const double save_sec = bench_now_sec() - save_t0;
+    if (rc != 0 || closerc != 0) {
+        fprintf(stderr, "ds4-bench: save-session failed: %s\n", rc != 0 ? err : "fclose");
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4-bench: COLD prefill of %d tokens in %.3f s (%.1f tok/s); "
+            "saved %.1f MiB payload to %s in %.3f s\n",
+            frontier, prefill_sec, prefill_sec > 0.0 ? frontier / prefill_sec : 0.0,
+            (double)payload_bytes / (1024.0 * 1024.0), cfg->save_session_path, save_sec);
+
+    if (dump_gen) fprintf(stderr, "ds4-bench: gen@%d(cold): ", frontier);
+    double gen_sec = 0.0;
+    if (bench_decode_gen(engine, session, cfg, eos, dump_gen, &gen_sec) != 0) return 1;
+    if (dump_gen) { fputc('\n', stderr); fflush(stderr); }
+    printf("mode,frontier,prefill_sec,prefill_tps,payload_bytes,gen_tokens,gen_tps\n");
+    printf("cold,%d,%.4f,%.2f,%llu,%d,%.2f\n", frontier, prefill_sec,
+           prefill_sec > 0.0 ? (double)frontier / prefill_sec : 0.0,
+           (unsigned long long)payload_bytes, cfg->gen_tokens,
+           gen_sec > 0.0 ? (double)cfg->gen_tokens / gen_sec : 0.0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
     log_context_memory(cfg.backend, cfg.ctx_alloc);
@@ -330,6 +489,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* DS4_BENCH_DUMP_GEN: dump greedy generation to stderr for correctness checks. */
+    const bool dump_gen_env = getenv("DS4_BENCH_DUMP_GEN") != NULL &&
+                              getenv("DS4_BENCH_DUMP_GEN")[0] != '\0' &&
+                              getenv("DS4_BENCH_DUMP_GEN")[0] != '0';
+
+    /* Prefix-cache demo path (default off).  Runs a single frontier and exits. */
+    if (cfg.save_session_path || cfg.load_session_path) {
+        const int srcrc = run_session_file_mode(engine, session, &prompt, &cfg,
+                                                 ds4_token_eos(engine), dump_gen_env);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return srcrc;
+    }
+
     FILE *out = stdout;
     if (cfg.csv_path) {
         out = fopen(cfg.csv_path, "wb");
@@ -345,13 +519,7 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
-    /* Optional, default-off: when DS4_BENCH_DUMP_GEN is set, decode the greedy
-     * generated tokens at each frontier and print them to stderr.  This lets a
-     * long-context capability demo verify that output is COHERENT (not just that
-     * the KV cache allocated and prefilled).  No effect on CSV or timing. */
-    const bool dump_gen = getenv("DS4_BENCH_DUMP_GEN") != NULL &&
-                          getenv("DS4_BENCH_DUMP_GEN")[0] != '\0' &&
-                          getenv("DS4_BENCH_DUMP_GEN")[0] != '0';
+    const bool dump_gen = dump_gen_env;
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
