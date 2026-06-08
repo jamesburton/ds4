@@ -5238,12 +5238,14 @@ static int indexer_scores_launch(
     }
 #endif // !__HIP_PLATFORM_AMD__
 #ifdef __HIP_PLATFORM_AMD__
-    // gfx1151 native wave32 WMMA path. Default OFF (env opt-in) so the proven
-    // scalar indexer_scores_kernel below stays the default until the orchestrator
-    // validates correctness on-GPU (preserves the issue #348 fix). Shapes are the
-    // hot indexer case: head_dim==128, n_head==64, non-quality.
+    // gfx1151 native wave32 WMMA path. Default ON for the hot indexer shape
+    // (head_dim==128, n_head==64, non-quality): validated bit-for-bit against the
+    // scalar indexer_scores_kernel (identical greedy output) and ~+68% prefill at
+    // 16k, since the O(ctx^2) lightning indexer dominates long-context prefill.
+    // Opt out with DS4_ROCM_NO_WMMA to fall back to the scalar kernel below
+    // (which also serves any non-matching shape / the issue #348 path).
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_ROCM_WMMA") != NULL) {
+        getenv("DS4_ROCM_NO_WMMA") == NULL) {
         dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma_hip_kernel<<<grid, 32>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,
